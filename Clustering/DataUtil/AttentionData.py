@@ -332,6 +332,37 @@ class AttentionData():
 
                                     self.data.insert_into(db, lang, correct, query, layer, head, 'enc_mean', encoded.mean(dim= 1).numpy())
                                     self.data.insert_into(db, lang, correct, query, layer, head, 'enc_cls', encoded[:,0,:].numpy())
+                                    
+    def generate_and_encode(self, attention_loader, encoding_model, batch_size = 150):
+        #TODO: fix for multilang
+        lang = 'java'
+        with h5py.File(self.data.DB_folder, mode='a', driver = 'family') as db:
+            for i in tqdm(attention_loader):
+                attention, query, correct = i
+                # attention = attention.detach().cpu().numpy()
+                layers = attention.shape[0]
+                heads = attention.shape[1]
+                attention = attention.reshape(layers*heads, attention.shape[2], attention.shape[3])
+
+                means = torch.tensor([])
+                clss = torch.tensor([])
+
+                for head_batch in self.chunker(attention, batch_size):
+                    scaled = log_normalize_scaler(torch.tensor(head_batch).unsqueeze(dim =1), None)
+                    encoded = encoding_model.encoder.encode(scaled).detach().cpu()
+                    idx = [0, 1, 9, 10, 17, 18, 19, 25, 26, 27, 28, 33, 34, 35, 36, 37, 41, 42, 43, 44, 45, 46, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59, 60, 61, 62, 63, 64]
+                    encoded = encoded[:,idx]
+
+                    means = torch.concat((means, encoded.mean(dim = 1)))
+                    clss = torch.concat((clss, encoded[:,0,:]))
+                means = means.reshape(layers, heads, means.shape[1]).numpy()
+                clss = clss.reshape(layers, heads, clss.shape[1]).numpy()
+
+                for l in range(layers):
+                    for h in range(heads):
+                        self.data.insert_into(db, lang, correct, query, l, h, 'enc_mean', means[l][h].reshape(1, 512))
+                        self.data.insert_into(db, lang, correct, query, l, h, 'enc_cls', clss[l][h].reshape(1, 512))
+
 
     def generate_patterns(self, attention_loader):
         #TODO: fix for multilang

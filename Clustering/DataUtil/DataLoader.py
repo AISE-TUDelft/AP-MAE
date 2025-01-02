@@ -4,6 +4,8 @@ import torch
 from transformers import AutoModelForCausalLM,  AutoTokenizer
 from datasets import load_dataset
 import random
+
+from random import choices, randint
 from DataUtil.LanguageParser import getParser,  getLanguage
 from DataUtil.TreeQuery import getQueryString, getQuery
 import torch.nn.functional as tnnf
@@ -20,34 +22,63 @@ class IterableQueryLoader(torch.utils.data.IterableDataset):
         self.query_name = query_name
         self.max_samples = max_samples
         self.tokenizer = AutoTokenizer.from_pretrained(self.model)
-        self.query = getQuery(query_name, self.lang, self.tokenizer)
+        if 'gpt2' not in model.lower():
+            if query_name == 'noise':
+                pass
+            else:
+                self.query = getQuery(query_name, self.lang, self.tokenizer)
     
     def __iter__(self):
         i = 0
-        iterator = iter(self.hf_dataset)
-        while i < self.max_samples:
-            try:
-                file = next(iterator)
-            except StopIteration:
-                iterator = iter(self.hf_dataset)
-                file = next(iterator)
-            try:
-                returnable = self.process(file)
+
+        if self.query_name == 'noise':
+            # if i > self.max_samples:
+            #     raise StopIteration
+            while i < self.max_samples:
+                returnable =  self.process(None)
                 i+=1
                 yield returnable, self.query_name
-            except ValueError:
-                continue
+        else:
+            iterator = iter(self.hf_dataset)
+            while i < self.max_samples:
+                try:
+                    file = next(iterator)
+                except StopIteration:
+                    iterator = iter(self.hf_dataset)
+                    file = next(iterator)
+                try:
+                    returnable = self.process(file)
+                    i+=1
+                    yield returnable, self.query_name
+                except ValueError:
+                    continue
 
     def __len__(self):
         return len(self.hf_dataset)
 
     def process(self,  sample):
         if "starcoder" in self.model.lower():
+            if self.query_name == 'noise':
+                return self.gen_noise_starcoder()
             return self.gen_subsample_starcoder(self.query.get_span(sample['content']))
         elif "gpt" in self.model.lower():
-            return self.gen_subsample_gpt(self.tokenize(*self.prep_gpt(sample['content'])))
+            return self.gen_subsample_gpt(self.tokenize(*self.prep_gpt(sample['ioi_sentences'])))
         else:
             raise ValueError
+            
+    def gen_noise_starcoder(self):
+        tokens = list(self.tokenizer.get_vocab().values())
+        noise = choices(tokens, k= self.max_length)
+        
+        noise[0] = 1
+        noise[-1] = 2
+        noise[randint(1, self.max_length-2)] = 3
+        
+        noise = torch.tensor(noise)
+        
+        sample = {}
+        sample['input'] = {'input_ids': noise, 'attention_mask': torch.tensor([1 for _ in noise])}
+        return sample
 
     def gen_subsample_starcoder(self, sample):
         ids = sample['input']['input_ids'].flatten()
@@ -80,6 +111,26 @@ class IterableQueryLoader(torch.utils.data.IterableDataset):
         sample['input']['attention_mask'] = mask
         return sample
     
+    def prep_gpt(self,  content):
+        if self.query_name == 'random':
+            tokens = self.tokenizer(content)['input_ids']
+            begin = random.randint(0, len(tokens)-15)
+            selection = tokens[0:begin]
+            target = tokens[begin:begin+5]
+            content = self.tokenizer.decode(selection)
+            target = self.tokenizer.decode(target)
+            return content, target
+        
+        #This is IOI only
+        context = ' '.join(content.split()[0:-1])
+        target = ' ' + content.split()[-1]
+
+        return context, target
+    
+    def gen_subsample_gpt(self, sample):
+        return sample
+    
+    
     def tokenize(self, content, label):
         input = self.tokenizer(content, return_tensors = 'pt')
         label = self.tokenizer(label, return_tensors = 'pt')
@@ -88,20 +139,23 @@ class IterableQueryLoader(torch.utils.data.IterableDataset):
 
 
 class IterableScenarioLoader(torch.utils.data.IterableDataset):
-    def __init__(self,  hf_dataset,  query_name, max_samples, max_length, lang, model):
+    def __init__(self,  hf_dataset,  query_name, max_samples, max_length, lang, model, min_length = 16):
         super(IterableScenarioLoader).__init__()
         self.hf_dataset = hf_dataset
         self.model = model
         self.lang = lang
         self.max_length = max_length
+        self.min_length = min_length
         
         self.tokenizer = AutoTokenizer.from_pretrained(self.model)
-        if query_name != "random":
+        self.query_name = query_name
+        self.max_samples = max_samples
+        
+        if query_name != "random" and 'starcoder' in self.model:
             self.query = getLanguage(self.lang).query(getQueryString(self.lang, query_name))
             self.parser = getParser(self.lang)
         
-        self.query_name = query_name
-        self.max_samples = max_samples
+
         
     def __iter__(self):
         i = 0
@@ -127,7 +181,11 @@ class IterableScenarioLoader(torch.utils.data.IterableDataset):
         if "starcoder" in self.model.lower():
             return self.gen_subsample_starcoder(self.tokenize(*self.prep_starcoder(sample['content'])))
         elif "gpt" in self.model.lower():
-            return self.gen_subsample_gpt(self.tokenize(*self.prep_gpt(sample['content'])))
+            if self.query_name =='ABBA' or self.query_name =='ABAB':
+                if self.query_name == sample['template']:
+                    return self.gen_subsample_gpt(self.tokenize(*self.prep_gpt(sample['ioi_sentences'])))
+            else:
+                return self.gen_subsample_gpt(self.tokenize(*self.prep_gpt(sample['content'])))
         else:
             raise ValueError
 
@@ -142,31 +200,17 @@ class IterableScenarioLoader(torch.utils.data.IterableDataset):
             target = self.tokenizer.decode(target)
             return content, target
         
-        content = bytes(content, "UTF-8")
-        tree = self.parser.parse(content)
-        captures = self.query.captures(tree.root_node)
-    
-        try:
-            capture = random.sample(captures, 1)[0]
-        except ValueError:
-            raise ValueError("No matches detected in sample")
-        
-        start = capture[0].start_byte
-        finish = capture[0].end_byte
-    
-        target = content[start:finish]
-        content = content[:start]
-    
-        content = content.decode("UTF-8")
-        target = target.decode("UTF-8")
+        #This is IOI only
+        context = ' '.join(content.split()[0:-1])
+        target = ' ' + content.split()[-1]
 
-        return content, target
+        return context, target
         
     def gen_subsample_gpt(self, content):
         ids = content['input']['input_ids'].flatten()
         mask = content['input']['attention_mask'].flatten()
         max = ids.size()[0]
-        if max < self.max_length:
+        if max < self.max_length and max > self.min_length:
             #pad
             #ids = torch.cat((torch.zeros(self.max_length-max), ids)).int()
             #mask = torch.cat((torch.zeros(self.max_length-max), mask)).int()
@@ -251,23 +295,21 @@ class IterableScenarioLoader(torch.utils.data.IterableDataset):
         return {"input": input, "label": label}
 
 class IterableScenarioAggregator(torch.utils.data.IterableDataset):
-    def __init__(self, dataset_location, max_samples, max_length, queries, lang, model, split):
+    def __init__(self, dataset, max_samples, max_length, queries, lang, model, split):
         self.max_samples = max_samples
         self.max_length = max_length
         self.queries = queries
         self.lang = lang
         self.model = model
-        self.dataset_location = dataset_location
-        self.hf_dataset = load_dataset(
-            self.dataset_location,
-            'Stackless_Java_V2',
-            split=split,
-            num_proc=64,
-            # optional use specific cache rather than global hugginface cache
-            # cache_dir="./cache"
-        )
-        self.hf_dataset = self.hf_dataset.filter(lambda row: len(row["near_dups_stkv2_idx"]) == 0, num_proc = 64)
-        self.hf_dataset = self.hf_dataset.shuffle()
+        # self.hf_dataset = load_dataset(
+        #     self.dataset_location,
+        #     self.subset_name,
+        #     split=split,
+        #     num_proc=64,
+        #     # optional use specific cache rather than global hugginface cache
+        #     # cache_dir="./cache"
+        # )
+        self.dataset = dataset.shuffle()
         self.reset()
         self.max_count = len(self.queries) * self.max_samples
         
@@ -300,25 +342,26 @@ class IterableScenarioAggregator(torch.utils.data.IterableDataset):
 
         self.scenario_iterators = []
         for query in self.queries:
-            self.scenario_iterators.append(iter(IterableQueryLoader(self.hf_dataset,  query, self.max_samples, self.max_length, self.lang, self.model)))
+            self.scenario_iterators.append(iter(IterableQueryLoader(self.dataset,  query, self.max_samples, self.max_length, self.lang, self.model)))
 
 
 
 class IterableAttentionLoader(torch.utils.data.IterableDataset):
-    def __init__(self, dataset_location,  max_samples, max_length, queries, lang, model, correct_only, target_model, target_model_device, split, evaluation = False):
+    def __init__(self, dataset,  max_samples, max_length, queries, lang, model, correct_only, target_model, target_model_device, split, evaluation = False, min_length = 16):
         self.target_model = target_model
         self.target_model_device = target_model_device
         self.correct_only = correct_only
-        self.dataset_location = dataset_location
+        self.dataset = dataset
         self.max_samples = max_samples
         self.max_length = max_length
+        self.min_length = 16
         self.queries = queries
         self.lang = lang
         self.model_name = model
         self.split = split
         self.max_count = len(self.queries) * self.max_samples
         self.count = 0
-        self.scenario_aggregator = IterableScenarioAggregator(self.dataset_location, 500000, self.max_length, self.queries, self.lang, self.model_name, self.split)
+        self.scenario_aggregator = IterableScenarioAggregator(self.dataset, 500000, self.max_length, self.queries, self.lang, self.model_name, self.split)
         self.evaluation = evaluation
 
 
@@ -333,9 +376,14 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
                 query = sample[1]
                 
                 inputs = sample[0]['input']
-                labels = sample[0]['label']
-
-                if inputs['input_ids'].size()[-1] < self.max_length:
+                if query != 'noise':
+                    labels = sample[0]['label']
+                
+                
+                if 'starcoder' in self.model_name and inputs['input_ids'].size()[-1] < self.max_length:
+                    continue
+                    
+                if 'gpt' in self.model_name and inputs['input_ids'].size()[-1] > self.max_length and inputs['input_ids'].size()[-1] < self.min_length:
                     continue
 
                 # not needed if device map is active, will be mapped
@@ -352,9 +400,11 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
                     )
 
                 preds = outputs.logits.squeeze()[-1,:].argmax(dim = -1)
+                
+                if query != 'noise':
+                    correct = preds.item() == labels['input_ids'].squeeze().flatten()[0].item()
 
-                correct = preds.item() == labels['input_ids'].squeeze().flatten()[0].item()
-
+                
                 attentions = outputs['attentions']
                 attentions = torch.cat(attentions)
                 
@@ -368,8 +418,23 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
                     'constant',
                     0
                 )
+                
+
+                
                 #Balances correct and incorrect in total, DOES NOT MATCH ON A TASK BASIS
                 if self.evaluation:
+                    if query == 'noise':
+                        a = self.correct_counts[query]
+                        b = self.incorrect_counts[query]
+                        if a < b:
+                            correct = 'correct'
+                            self.correct_counts[query] += 1
+                        else:
+                            correct='incorrect'
+                            self.incorrect_counts[query] += 1
+                        yield attentions, query, correct
+                        self.count += 1
+                        continue
                     if not self.correct_only:
                         if correct:
                             if self.correct_counts[query] < (self.max_samples//2):
