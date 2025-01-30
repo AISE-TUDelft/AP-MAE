@@ -259,7 +259,7 @@ def visualize_sample(config, model, pixel_values, epoch, samples_seen, selected_
         
         show_image(axes[0], original_image, "original attention")
         show_image(axes[1], selected_patches, "unmasked input", hide_top_right=True, hide_patches=masked_indices[selected_head])
-        show_image(axes[2], predicted_patches, f"predicted output", hide_top_right=True, hide_patches=unmasked_indices[0],subtitle=f"loss:{loss:.2e}")
+        show_image(axes[2], predicted_patches, f"predicted output", hide_top_right=True, hide_patches=unmasked_indices[selected_head],subtitle=f"loss:{loss:.2e}")
         img = show_image(axes[3], reconstructed, f"combined reconstruction", hide_top_right=True, title_x=0.6)
 
         # add colorbar, using colordata scale from last subplot
