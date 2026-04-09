@@ -16,4 +16,4 @@ For further instructions on running the code, please refer to the README files i
 
 We list the StackLessV2 Java dataset the subset of The Heap used for training [here](https://huggingface.co/datasets/LaughingLogits/Stackless_Java_V2).
 
-We release the AP-MAE model collection [here](https://huggingface.co/collections/LaughingLogits/ap-mae-models-66b27a73536bb1306d55c4c4).
+We release the AP-MAE model collection [here](https://huggingface.co/collections/AISE-TUDelft/ap-mae).
