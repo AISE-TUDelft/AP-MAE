@@ -92,7 +92,10 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from einops import rearrange
-from DataUtil.DDPDataLoader import IterableAttentionDataset
+from DataUtil.DDPDataLoader import (
+    IterableAttentionDataset,
+    IterableMultilingualAttentionDataset,
+)
 from DataUtil.Scalers import select_scaler
 from tqdm import tqdm
 from datetime import datetime
@@ -335,6 +338,55 @@ def test(config, model, test_loader, scaler, gpu, output_dir):
             wandb.log({'validation_loss': val_loss})
     print("test time: ", (datetime.now() - t1).total_seconds())
 
+
+def build_attention_loader(
+    config,
+    dataset_split,
+    max_batches,
+    batch_size,
+    head_selection_strategy,
+    rank,
+    world_size,
+    tokenizer,
+    target_model,
+    gpu,
+):
+    if hasattr(config, "languages") and config.languages:
+        return IterableMultilingualAttentionDataset(
+            config=config,
+            dataset_split=dataset_split,
+            max_batches=max_batches,
+            batch_size=batch_size,
+            head_selection_strategy=head_selection_strategy,
+            rank=rank,
+            world_size=world_size,
+            tokenizer=tokenizer,
+            target_model=target_model,
+            gpu=gpu,
+        )
+    return IterableAttentionDataset(
+        config=config,
+        dataset_location=config.dataset_location,
+        dataset_split=dataset_split,
+        max_batches=max_batches,
+        min_length=config.min_length,
+        max_length=config.max_length,
+        queries=config.queries,
+        lang=config.lang,
+        correct_only=config.correct_only,
+        target_model_name=config.target_model_name,
+        target_model_device=gpu,
+        num_proc=config.iter_loader_workers,
+        reset_after_iter=True,
+        equal_query_quantities=True,
+        rank=rank,
+        world_size=world_size,
+        batch_size=batch_size,
+        tokenizer=tokenizer,
+        target_model=target_model,
+        head_selection_strategy=head_selection_strategy,
+    )
+
 ddp_backend_enabled = None
 def main():
     config = APMAEConfig(**run_config)
@@ -400,7 +452,11 @@ def main():
     print("effective batch size adjusted lr: %.2e" % eff_learning_rate)
 
     with torch.inference_mode():
-        tokenizer = AutoTokenizer.from_pretrained(config.target_model_name)
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.target_model_name,
+            trust_remote_code=True,
+            use_fast=False,
+        )
         # device map model parallelism if set and model supports it
         if config.target_model_device == 'device_map':
             # fix wandb forcing dict string keys
@@ -420,58 +476,39 @@ def main():
                 device_map = config.target_model_device_map,
                 offload_folder = config.target_model_offload_folder,
                 max_memory = target_model_memory_limits,
+                attn_implementation="eager",
             )
         else:
             target_model = AutoModelForCausalLM.from_pretrained(
                 config.target_model_name, 
-                # use accelerate to immediately load on gpu, no cpu mem used.
-                device_map = gpu, 
+                attn_implementation="eager",
             )
+            target_model = target_model.to(gpu)
         target_model.eval()
     
-    train_loader = IterableAttentionDataset(
-        config = config, 
-        dataset_location = config.dataset_location, 
-        dataset_split = config.dataset_train_split, 
-        max_batches = config.train_batches, 
-        min_length = config.min_length, 
-        max_length = config.max_length, 
-        queries = config.queries, 
-        lang = config.lang, 
-        correct_only = config.correct_only, 
-        target_model_name = config.target_model_name, 
-        target_model_device = gpu, 
-        num_proc = config.iter_loader_workers, 
-        reset_after_iter = True, 
-        equal_query_quantities = True, 
-        rank = rank, 
-        world_size = world_size, 
-        batch_size = config.train_batch_size, 
-        tokenizer = tokenizer, 
-        target_model = target_model, 
-        head_selection_strategy = config.train_head_selection_strategy, 
+    train_loader = build_attention_loader(
+        config=config,
+        dataset_split=config.dataset_train_split,
+        max_batches=config.train_batches,
+        batch_size=config.train_batch_size,
+        head_selection_strategy=config.train_head_selection_strategy,
+        rank=rank,
+        world_size=world_size,
+        tokenizer=tokenizer,
+        target_model=target_model,
+        gpu=gpu,
     )
-    test_loader = IterableAttentionDataset(
-        config = config, 
-        dataset_location = config.dataset_location, 
-        dataset_split = config.dataset_test_split, 
-        max_batches = config.val_batches, 
-        min_length = config.min_length, 
-        max_length = config.max_length, 
-        queries = config.queries, 
-        lang = config.lang, 
-        correct_only = config.correct_only, 
-        target_model_name = config.target_model_name, 
-        target_model_device = gpu, 
-        num_proc = config.iter_loader_workers, 
-        reset_after_iter = True, 
-        equal_query_quantities = True, 
-        rank = rank, 
-        world_size = world_size, 
-        batch_size=config.test_batch_size, 
-        tokenizer = tokenizer, 
-        target_model = target_model, 
-        head_selection_strategy = config.test_head_selection_strategy, 
+    test_loader = build_attention_loader(
+        config=config,
+        dataset_split=config.dataset_test_split,
+        max_batches=config.val_batches,
+        batch_size=config.test_batch_size,
+        head_selection_strategy=config.test_head_selection_strategy,
+        rank=rank,
+        world_size=world_size,
+        tokenizer=tokenizer,
+        target_model=target_model,
+        gpu=gpu,
     )
     
     if config.ap_mae_preload_name is not None:

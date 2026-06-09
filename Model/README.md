@@ -22,3 +22,7 @@ The configs to reproduce the models used in the paper can be selected as:
 Due to the combined VRAM requirements of both models and the retrieval of attention heads with output_attentions=True, the paper configurations will require A40's or comparible GPUs or significant additional VRAM management. Training these models on a relevant number of samples will require enabling the provided distributed data parallel setup (or a similar one).
 
 Options for distributed training, wandb logging and loading models and datasets from huggingface remain included but are disabled by default for the fast demo.
+
+The training package includes [`Model/DataUtil`](./DataUtil), which is required
+by `train_ap_mae.py`. Its README documents remote and local datasets,
+multilingual loading, tree-sitter queries, and yielded attention batches.

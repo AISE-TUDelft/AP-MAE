@@ -12,6 +12,8 @@ The [**Model**](./Model) directory comprises all the code for building the *AP-M
 
 For further instructions on running the code, please refer to the README files in each directory. 
 
+This package includes the training data utilities required by `Model/train_ap_mae.py`, and tree-sitter-backed parsing paths for Java and C++/CPP query extraction.
+
 # Links
 
 We list the StackLessV2 Java dataset the subset of The Heap used for training [here](https://huggingface.co/datasets/LaughingLogits/Stackless_Java_V2).

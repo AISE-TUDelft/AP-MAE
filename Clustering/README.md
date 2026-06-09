@@ -8,3 +8,7 @@ You can query the database by changing the selectors (marked in the notebook) fr
 run.ipynb contains a notebook that runs the entire pipeline from start to finish. It is important to note that running with the settings from the paper requires 125TB of storage, the bottleneck is also disk write speed, and GPU -> disk transfer rates. This is mainly due to saving all attention patterns, so we can evaluate the clusters. For future versions, we will provide an option to only save the encodings. Use the generate_and_encode to reduce this to 1TB disk usage.
 
 All code can run on a single 80GB a100, or a 32GB v100 card if running just for the 3B and 7B models.
+
+See [`Clustering/DataUtil`](./DataUtil) for scenario aggregation, attention
+loading, Java/C++ query parsing, multilingual storage, and short usage
+examples.

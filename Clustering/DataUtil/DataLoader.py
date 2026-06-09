@@ -1,27 +1,38 @@
 # -*- coding: utf-8 -*-
 # DataUtil/DataLoader.py
 import torch
-from transformers import AutoModelForCausalLM,  AutoTokenizer
+from transformers import AutoTokenizer
 from datasets import load_dataset
 import random
 
 from random import choices, randint
-from DataUtil.LanguageParser import getParser,  getLanguage
+from DataUtil.LanguageParser import getParser, getLanguage, normalize_language_name
 from DataUtil.TreeQuery import getQueryString, getQuery
 import torch.nn.functional as tnnf
+
+
+def _load_dataset_input(dataset, split):
+    if isinstance(dataset, str):
+        return load_dataset(dataset, split=split)
+    return dataset
+
 
 class IterableQueryLoader(torch.utils.data.IterableDataset):
     def __init__(self, hf_dataset, query_name, max_samples, max_length, lang, model):
         super(IterableQueryLoader).__init__()
         self.hf_dataset = hf_dataset
         self.model = model
-        self.lang = lang
+        self.lang = normalize_language_name(lang)
         self.max_length = max_length
 
 
         self.query_name = query_name
         self.max_samples = max_samples
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model,
+            trust_remote_code=True,
+            use_fast=False,
+        )
         if 'gpt2' not in model.lower():
             if query_name == 'noise':
                 pass
@@ -54,7 +65,7 @@ class IterableQueryLoader(torch.utils.data.IterableDataset):
                     continue
 
     def __len__(self):
-        return len(self.hf_dataset)
+        return self.max_samples
 
     def process(self,  sample):
         if "starcoder" in self.model.lower():
@@ -142,7 +153,7 @@ class LanguageAggregator(torch.utils.data.IterableDataset):
     def __init__(self, dataset_name, languages, max_samples, max_length ,queries, model, correct_only, target_model, target_model_device, split, evaluation, min_length):
         super(LanguageAggregator).__init__()
         self.max_length = max_length
-        self.languages = languages
+        self.languages = [normalize_language_name(lang) for lang in languages]
         self.dataset_name = dataset_name
         self.max_samples = max_samples
         self.queries = queries
@@ -154,46 +165,66 @@ class LanguageAggregator(torch.utils.data.IterableDataset):
         self.evaluation = evaluation
         self.min_length = min_length
 
-        self.iterators = []
-
+        self.max_count = len(self.languages) * len(self.queries) * self.max_samples
         self.reset()
 
     def __iter__(self):
-        while len(self.iterators) > 0:
+        while self.count < self.max_count and self.iterators:
+            iterator = random.choice(self.iterators)
             try:
-                iterator = random.choice(self.iterators)
                 next_item = next(iterator)
-                yield next_item
             except StopIteration:
                 self.iterators.remove(iterator)
-                if len(self.iterators) == 0:
-                    self.reset()
-                    return
             except ValueError:
                 continue
+            else:
+                self.count += 1
+                yield next_item
+        self.reset()
 
 
     def __len__(self):
-        accumulator = 0
-        for it in self.iterators:
-            accumulator += len(it)
-        return accumulator
+        return self.max_count - self.count
 
 
     def reset(self):
+        self.count = 0
+        self.loaders = []
+        self.iterators = []
         for language in self.languages:
             dataset = load_dataset(
                 self.dataset_name,
                 f"{language}",
-                split="train",
+                split=self.split,
                 num_proc=16
             )
 
-            dataset = dataset.filter(lambda x: not x[f'exact_duplicates_stackv2'] and not x[f'near_duplicates_stackv2'])
+            duplicate_columns = {
+                "exact_duplicates_stackv2",
+                "near_duplicates_stackv2",
+            }
+            if duplicate_columns.issubset(set(getattr(dataset, "column_names", []))):
+                dataset = dataset.filter(
+                    lambda x: not x["exact_duplicates_stackv2"]
+                    and not x["near_duplicates_stackv2"]
+                )
 
-            loader = iter(IterableAttentionLoader(dataset, self.max_samples, self.max_length, self.queries, language, self.model, self.correct_only, self.target_model, self.target_model_device, self.split, self.evaluation, self.min_length))
-
-            self.iterators.append(loader)
+            loader = IterableAttentionLoader(
+                dataset,
+                self.max_samples,
+                self.max_length,
+                self.queries,
+                language,
+                self.model,
+                self.correct_only,
+                self.target_model,
+                self.target_model_device,
+                self.split,
+                self.evaluation,
+                self.min_length,
+            )
+            self.loaders.append(loader)
+            self.iterators.append(iter(loader))
 
 
 class IterableScenarioLoader(torch.utils.data.IterableDataset):
@@ -201,11 +232,15 @@ class IterableScenarioLoader(torch.utils.data.IterableDataset):
         super(IterableScenarioLoader).__init__()
         self.hf_dataset = hf_dataset
         self.model = model
-        self.lang = lang
+        self.lang = normalize_language_name(lang)
         self.max_length = max_length
         self.min_length = min_length
         
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model,
+            trust_remote_code=True,
+            use_fast=False,
+        )
         self.query_name = query_name
         self.max_samples = max_samples
         
@@ -233,7 +268,7 @@ class IterableScenarioLoader(torch.utils.data.IterableDataset):
 
                 
     def __len__(self):
-        return len(self.hf_dataset)
+        return self.max_samples
         
     def process(self,  sample):
         if "starcoder" in self.model.lower():
@@ -358,8 +393,8 @@ class IterableScenarioAggregator(torch.utils.data.IterableDataset):
     def __init__(self, dataset, max_samples, max_length, queries, lang, model, split):
         self.max_samples = max_samples
         self.max_length = max_length
-        self.queries = queries
-        self.lang = lang
+        self.queries = list(queries)
+        self.lang = normalize_language_name(lang)
         self.model = model
         # self.hf_dataset = load_dataset(
         #     self.dataset_location,
@@ -369,24 +404,25 @@ class IterableScenarioAggregator(torch.utils.data.IterableDataset):
         #     # optional use specific cache rather than global hugginface cache
         #     # cache_dir="./cache"
         # )
-        self.dataset = dataset.shuffle()
-        self.reset()
+        self.dataset = _load_dataset_input(dataset, split)
+        if hasattr(self.dataset, "shuffle"):
+            self.dataset = self.dataset.shuffle()
         self.max_count = len(self.queries) * self.max_samples
+        self.reset()
         
     def __iter__(self):
-        while len(self.scenario_iterators) > 0:
+        while self.count < self.max_count and self.scenario_iterators:
+            iterator = random.choice(self.scenario_iterators)
             try:
-                iterator = random.choice(self.scenario_iterators)
                 next_item = next(iterator)
-                self.count += 1
-                yield next_item
             except StopIteration:
                 self.scenario_iterators.remove(iterator)
-                if len(self.scenario_iterators) == 0:
-                    self.reset()
-                    return
             except ValueError:
                 continue
+            else:
+                self.count += 1
+                yield next_item
+        self.reset()
                 
     def __len__(self):
         """
@@ -411,17 +447,25 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
         self.target_model = target_model
         self.target_model_device = target_model_device
         self.correct_only = correct_only
-        self.dataset = dataset
+        self.dataset = _load_dataset_input(dataset, split)
         self.max_samples = max_samples
         self.max_length = max_length
         self.min_length = min_length
-        self.queries = queries
-        self.lang = lang
+        self.queries = list(queries)
+        self.lang = normalize_language_name(lang)
         self.model_name = model
         self.split = split
         self.max_count = len(self.queries) * self.max_samples
         self.count = 0
-        self.scenario_aggregator = IterableScenarioAggregator(self.dataset, 500000, self.max_length, self.queries, self.lang, self.model_name, self.split)
+        self.scenario_aggregator = IterableScenarioAggregator(
+            self.dataset,
+            500000,
+            self.max_length,
+            self.queries,
+            self.lang,
+            self.model_name,
+            self.split,
+        )
         self.evaluation = evaluation
 
 
@@ -429,23 +473,26 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
 
 
     def __iter__(self):
-        try:
+        while self.count < self.max_count:
             for sample in self.scenario_aggregator:
-                if self.count == self.max_count:
-                    raise StopIteration
+                if self.count >= self.max_count:
+                    break
                 query = sample[1]
                 
                 inputs = sample[0]['input']
                 if query != 'noise':
                     labels = sample[0]['label']
                     if len(labels['input_ids'].squeeze().flatten()) == 0:
-                        print("mamu mia")
                         continue
                 
-                if 'starcoder' in self.model_name and inputs['input_ids'].size()[-1] < self.max_length:
+                model_name = self.model_name.lower()
+                input_length = inputs['input_ids'].size()[-1]
+                if 'starcoder' in model_name and input_length < self.max_length:
                     continue
                     
-                if 'gpt' in self.model_name and inputs['input_ids'].size()[-1] > self.max_length and inputs['input_ids'].size()[-1] < self.min_length:
+                if 'gpt' in model_name and (
+                    input_length > self.max_length or input_length < self.min_length
+                ):
                     continue
 
                 # not needed if device map is active, will be mapped
@@ -466,9 +513,15 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
                 if query != 'noise':
                     try:
                         correct = preds.item() == labels['input_ids'].squeeze().flatten()[0].item()
-                    except:
-                        print("mama mia")
+                    except (IndexError, RuntimeError, ValueError):
                         continue
+                elif self.correct_only:
+                    correct = True
+                else:
+                    correct = (
+                        self.correct_counts[query]
+                        < ((self.max_samples + 1) // 2)
+                    )
                 
                 attentions = outputs['attentions']
                 attentions = torch.cat(attentions)
@@ -497,53 +550,49 @@ class IterableAttentionLoader(torch.utils.data.IterableDataset):
                         else:
                             correct='incorrect'
                             self.incorrect_counts[query] += 1
-                        yield attentions, query, correct
                         self.count += 1
+                        yield attentions, query, correct
                         continue
                     if not self.correct_only:
                         if correct:
-                            if self.correct_counts[query] < (self.max_samples//2):
+                            if self.correct_counts[query] < ((self.max_samples + 1)//2):
                                 self.correct_counts[query] +=1
+                                self.count += 1
                                 yield attentions, query, 'correct' if correct else 'incorrect'
                             else:
                                 continue
                         else:
                             if self.incorrect_counts[query] < (self.max_samples//2):
                                 self.incorrect_counts[query] += 1
+                                self.count += 1
                                 yield attentions, query, 'correct' if correct else 'incorrect'
                             else:
                                 continue
-                        self.count += 1
                         continue
                 attentions = attentions.reshape((attentions.size()[0] * attentions.size()[1],1,attentions.size()[-1], attentions.size()[-1]))
 
                 if not self.correct_only:
                     if correct:
-                        if self.correct_counts[query] < (self.max_samples//2):
+                        if self.correct_counts[query] < ((self.max_samples + 1)//2):
                             self.correct_counts[query] += 1
+                            self.count += 1
                             yield attentions, query, correct
                         else:
                             continue
                     else:
                         if self.incorrect_counts[query] < (self.max_samples//2):
                             self.incorrect_counts[query] += 1
+                            self.count += 1
                             yield attentions, query, correct
                         else:
                             continue
-                    self.count += 1
                     continue
 
                 if correct:
                     self.count += 1
                     yield attentions, query
                     continue
-
-        except StopIteration:
-            if self.__len__() > 0:
-                self.scenario_aggregator.reset()
-            else:
-                self.reset()
-                return
+        self.reset()
                     
     def __len__(self):
         return self.max_count - self.count

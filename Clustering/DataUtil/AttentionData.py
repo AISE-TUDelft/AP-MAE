@@ -5,6 +5,7 @@ from statistics import mode
 from tqdm import tqdm
 import torch
 import regex as re
+from DataUtil.LanguageParser import normalize_language_name
 from DataUtil.Scalers import log_normalize_scaler
 
 #Keep track of attention data in a dict of size, Query, Layer, Head
@@ -304,16 +305,22 @@ class AttentionData():
     def __init__(self, model_config, queries, languages, db_name, size):
         self.layers = model_config.num_hidden_layers
         self.heads = model_config.num_attention_heads
+        languages = [normalize_language_name(lang) for lang in languages]
 
         tree_string = '({} ({} ({} ({} ({})))))'.format(' '.join(languages), ' '.join(['correct', 'incorrect']), ' '.join(queries), ' '.join([str(x) for x in range(0, self.layers)]), ' '.join([str(x) for x in range(0, self.heads)]))
 
-        self.data = Attention_DB(db_name, langs = ['java'], corrects = ['correct', 'incorrect'], querys = queries, layers = list(range(self.layers)), heads = list(range(self.heads)), size= size)
+        self.data = Attention_DB(db_name, langs = languages, corrects = ['correct', 'incorrect'], querys = queries, layers = list(range(self.layers)), heads = list(range(self.heads)), size= size)
 
     def getByQuery(self, lang, correct, query, layer, head, types):
         self.data.get(lang, correct, query, layer, head, types)
     
     def chunker(self, seq, size):
         return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+
+    def _coerce_attention_loaders(self, attention_loaders):
+        if hasattr(attention_loaders, "lang"):
+            return [attention_loaders]
+        return attention_loaders
 
     def encode(self, encoding_model, attention_loader = None):
         with h5py.File(self.data.DB_folder, mode='a', driver ='family') as db:
@@ -339,50 +346,53 @@ class AttentionData():
                                     self.data.insert_into(db, lang, correct, query, layer, head, 'enc_mean', encoded.mean(dim= 1).numpy())
                                     self.data.insert_into(db, lang, correct, query, layer, head, 'enc_cls', encoded[:,0,:].numpy())
                                     
-    def generate_and_encode(self, attention_loader, encoding_model, batch_size = 150):
-        #TODO: fix for multilang
-        lang = 'java'
-        with h5py.File(self.data.DB_folder, mode='a', driver = 'family') as db:
-            for i in tqdm(attention_loader):
-                attention, query, correct = i
-                # attention = attention.detach().cpu().numpy()
-                layers = attention.shape[0]
-                heads = attention.shape[1]
-                attention = attention.reshape(layers*heads, attention.shape[2], attention.shape[3])
+    def generate_and_encode(self, attention_loaders, encoding_model, batch_size = 150):
+        for attention_loader in self._coerce_attention_loaders(attention_loaders):
+            lang = normalize_language_name(attention_loader.lang)
+            with h5py.File(self.data.DB_folder, mode='a', driver = 'family') as db:
+                for i in tqdm(attention_loader):
+                    attention, query, correct = i
+                    correct = 'correct' if correct is True else correct
+                    correct = 'incorrect' if correct is False else correct
+                    layers = attention.shape[0]
+                    heads = attention.shape[1]
+                    attention = attention.reshape(layers*heads, attention.shape[2], attention.shape[3])
 
-                means = torch.tensor([])
-                clss = torch.tensor([])
+                    means = []
+                    clss = []
 
-                for head_batch in self.chunker(attention, batch_size):
-                    scaled = log_normalize_scaler(torch.tensor(head_batch).unsqueeze(dim =1), None)
-                    encoded = encoding_model.encoder.encode(scaled).detach().cpu()
-                    idx = [0, 1, 9, 10, 17, 18, 19, 25, 26, 27, 28, 33, 34, 35, 36, 37, 41, 42, 43, 44, 45, 46, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59, 60, 61, 62, 63, 64]
-                    encoded = encoded[:,idx]
+                    for head_batch in self.chunker(attention, batch_size):
+                        scaled = log_normalize_scaler(head_batch.unsqueeze(dim =1), None)
+                        encoded = encoding_model.encoder.encode(scaled).detach().cpu()
+                        idx = [0, 1, 9, 10, 17, 18, 19, 25, 26, 27, 28, 33, 34, 35, 36, 37, 41, 42, 43, 44, 45, 46, 49, 50, 51, 52, 53, 54, 55, 57, 58, 59, 60, 61, 62, 63, 64]
+                        encoded = encoded[:,idx]
 
-                    means = torch.concat((means, encoded.mean(dim = 1)))
-                    clss = torch.concat((clss, encoded[:,0,:]))
-                means = means.reshape(layers, heads, means.shape[1]).numpy()
-                clss = clss.reshape(layers, heads, clss.shape[1]).numpy()
+                        means.append(encoded.mean(dim = 1))
+                        clss.append(encoded[:,0,:])
+                    means = torch.cat(means)
+                    clss = torch.cat(clss)
+                    means = means.reshape(layers, heads, means.shape[1]).numpy()
+                    clss = clss.reshape(layers, heads, clss.shape[1]).numpy()
 
-                for l in range(layers):
-                    for h in range(heads):
-                        self.data.insert_into(db, lang, correct, query, l, h, 'enc_mean', means[l][h].reshape(1, 512))
-                        self.data.insert_into(db, lang, correct, query, l, h, 'enc_cls', clss[l][h].reshape(1, 512))
+                    for l in range(layers):
+                        for h in range(heads):
+                            self.data.insert_into(db, lang, correct, query, l, h, 'enc_mean', means[l][h].reshape(1, -1))
+                            self.data.insert_into(db, lang, correct, query, l, h, 'enc_cls', clss[l][h].reshape(1, -1))
 
 
-    def generate_patterns(self, attention_loader):
-        #TODO: fix for multilang
-        lang = 'java'
-        with h5py.File(self.data.DB_folder, mode='a', driver = 'family') as db:
-            for i in tqdm(attention_loader):
-                attention, query, correct = i
-                attention = attention.detach().cpu().numpy()
+    def generate_patterns(self, attention_loaders):
+        for attention_loader in self._coerce_attention_loaders(attention_loaders):
+            lang = normalize_language_name(attention_loader.lang)
+            with h5py.File(self.data.DB_folder, mode='a', driver = 'family') as db:
+                for i in tqdm(attention_loader):
+                    attention, query, correct = i
+                    correct = 'correct' if correct is True else correct
+                    correct = 'incorrect' if correct is False else correct
+                    attention = attention.detach().cpu().numpy()
 
-                for l, layer in enumerate(attention):
-                    for h, head in enumerate(layer):
-                        # print("inserting: {}, {}, {}, {}, {}, raw".format(lang, correct, query, l, h))
-                        # print(head.shape)
-                        self.data.insert_into(db, lang, correct, query, l, h, "raw", [head])
+                    for l, layer in enumerate(attention):
+                        for h, head in enumerate(layer):
+                            self.data.insert_into(db, lang, correct, query, l, h, "raw", [head])
 
     def train_classifier(self, n_clusters, langs = "*", corrects = "*", querys = "*", layers = "*", heads = "*"):
 
@@ -430,4 +440,3 @@ class AttentionData():
         plt.xlabel('Head')
         plt.ylabel('Layer')
         plt.show()
-
